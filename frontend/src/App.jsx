@@ -17,17 +17,27 @@ import {
   LuPlay,
   LuMaximize,
   LuMinimize,
-  LuNavigation,
   LuWifi,
   LuWifiOff,
-  LuActivity,
+  LuNavigation,
   LuSpline,
-  LuRadar
+  LuRadar,
+  LuScanSearch
 } from 'react-icons/lu';
 import { BACKEND_URL, API_KEY } from './config';
 
 const MAX_POINTS = 500;
 const jsonHeaders = { 'Content-Type': 'application/json', 'x-api-key': API_KEY };
+
+// A hop faster than this (or a gap longer than this) starts a new trail segment,
+// so simulated pings or long outages don't draw lines across the country.
+const MAX_PLAUSIBLE_KMH = 250;
+const MAX_GAP_KM = 2;
+// Moves smaller than this are GPS jitter and don't count toward distance.
+const JITTER_KM = 0.004;
+
+// Tracker counts as online if it pinged (heartbeat or fix) within this window.
+const ONLINE_TIMEOUT_MS = 30_000;
 
 function haversineDistance(lat1, lon1, lat2, lon2) {
   const R = 6371;
@@ -39,11 +49,36 @@ function haversineDistance(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// Split history into continuous segments and sum real travel distance.
+function analyseTrack(points) {
+  const segments = [];
+  let current = [];
+  let km = 0;
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const prev = points[i - 1];
+    if (prev) {
+      const d = haversineDistance(prev.latitude, prev.longitude, p.latitude, p.longitude);
+      const hours = Math.max(1, new Date(p.timestamp) - new Date(prev.timestamp)) / 3_600_000;
+      const isJump = d > MAX_GAP_KM || d / hours > MAX_PLAUSIBLE_KMH;
+      if (isJump) {
+        if (current.length) segments.push(current);
+        current = [];
+      } else if (d > JITTER_KM) {
+        km += d;
+      }
+    }
+    current.push([p.latitude, p.longitude]);
+  }
+  if (current.length) segments.push(current);
+  return { segments, km };
+}
+
 function fixQuality(sats) {
   if (sats >= 8) return { label: 'Strong fix', tone: 'green' };
   if (sats >= 4) return { label: 'Good fix', tone: 'blue' };
   if (sats > 0) return { label: 'Weak fix', tone: 'amber' };
-  return { label: 'Searching', tone: 'gray' };
+  return { label: 'No fix', tone: 'gray' };
 }
 
 function timeAgo(timestamp) {
@@ -55,36 +90,50 @@ function timeAgo(timestamp) {
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ago`;
 }
 
+// Google Maps tiles: m = roadmap, y = satellite + labels, p = terrain
+const google = (lyrs) =>
+  L.tileLayer(`https://mt{s}.google.com/vt/lyrs=${lyrs}&x={x}&y={y}&z={z}`, {
+    subdomains: '0123',
+    maxZoom: 21,
+    attribution: '&copy; Google Maps'
+  });
+
 const LAYERS = [
-  { key: 'dark', label: 'Dark' },
-  { key: 'streets', label: 'Streets' },
-  { key: 'satellite', label: 'Satellite' }
+  { key: 'map', label: 'Map' },
+  { key: 'satellite', label: 'Satellite' },
+  { key: 'terrain', label: 'Terrain' }
 ];
 
 export default function App() {
   const [latestPoint, setLatestPoint] = useState(null);
+  const [device, setDevice] = useState(null); // { lastSeen, hasFix, satellites }
+  const [laptopPos, setLaptopPos] = useState(null);
   const [history, setHistory] = useState([]);
   const [connection, setConnection] = useState('connecting'); // online | connecting | offline
   const [autoRecenter, setAutoRecenter] = useState(true);
-  const [showTrail, setShowTrail] = useState(true);
-  const [layer, setLayer] = useState('dark');
+  const [showTrail, setShowTrail] = useState(false);
+  const [layer, setLayer] = useState('map');
   const [copied, setCopied] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
-  const [, setTick] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
 
   const mapEl = useRef(null);
   const map = useRef(null);
   const marker = useRef(null);
+  const startMarker = useRef(null);
   const accuracy = useRef(null);
   const trail = useRef(null);
   const trailGlow = useRef(null);
   const tiles = useRef({});
   const autoRecenterRef = useRef(true);
+  const lastSource = useRef(null);
 
   useEffect(() => {
     autoRecenterRef.current = autoRecenter;
   }, [autoRecenter]);
+
+  const track = useMemo(() => analyseTrack(history), [history]);
 
   // ---------- Map ----------
   useEffect(() => {
@@ -94,38 +143,21 @@ export default function App() {
       center: [20.5937, 78.9629],
       zoom: 5,
       zoomControl: false,
-      zoomSnap: 0.5,
-      attributionControl: true
+      zoomSnap: 0.5
     });
     L.control.zoom({ position: 'bottomright' }).addTo(m);
     L.control.scale({ position: 'bottomleft', imperial: false }).addTo(m);
 
-    const carto = (style) =>
-      L.tileLayer(`https://{s}.basemaps.cartocdn.com/${style}/{z}/{x}/{y}{r}.png`, {
-        attribution: '&copy; OpenStreetMap &copy; CARTO',
-        subdomains: 'abcd',
-        maxZoom: 20
-      });
-
     tiles.current = {
-      dark: carto('dark_all'),
-      streets: carto('rastertiles/voyager'),
-      satellite: L.layerGroup([
-        L.tileLayer(
-          'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-          { attribution: 'Tiles &copy; Esri', maxZoom: 19 }
-        ),
-        L.tileLayer(
-          'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
-          { maxZoom: 19 }
-        )
-      ])
+      map: google('m'),
+      satellite: google('y'),
+      terrain: google('p')
     };
-    tiles.current.dark.addTo(m);
+    tiles.current.map.addTo(m);
 
-    trailGlow.current = L.polyline([], { color: '#38bdf8', weight: 10, opacity: 0.18, lineCap: 'round' }).addTo(m);
-    trail.current = L.polyline([], { color: '#38bdf8', weight: 4, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }).addTo(m);
-    accuracy.current = L.circle([0, 0], { radius: 15, color: '#38bdf8', weight: 1, fillColor: '#38bdf8', fillOpacity: 0.12 });
+    trailGlow.current = L.polyline([], { color: '#2563eb', weight: 8, opacity: 0.15, lineCap: 'round', lineJoin: 'round' }).addTo(m);
+    trail.current = L.polyline([], { color: '#2563eb', weight: 3.5, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }).addTo(m);
+    accuracy.current = L.circle([0, 0], { radius: 12, color: '#2563eb', weight: 1, fillColor: '#2563eb', fillOpacity: 0.08 });
 
     marker.current = L.marker([0, 0], {
       icon: L.divIcon({
@@ -135,6 +167,10 @@ export default function App() {
         iconAnchor: [14, 14]
       }),
       zIndexOffset: 1000
+    });
+    startMarker.current = L.marker([0, 0], {
+      icon: L.divIcon({ className: 'start-marker', html: '<span></span>', iconSize: [14, 14], iconAnchor: [7, 7] }),
+      title: 'Trail start'
     });
 
     m.on('dragstart', () => setAutoRecenter(false));
@@ -153,21 +189,28 @@ export default function App() {
       if (key === layer) l.addTo(m);
       else m.removeLayer(l);
     });
-    // keep trail above imagery
-    trailGlow.current?.bringToFront();
-    trail.current?.bringToFront();
   }, [layer]);
+
+  // Draw the trail from history (multi-segment polyline)
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !trail.current) return;
+    const { segments } = track;
+    trail.current.setLatLngs(segments);
+    trailGlow.current.setLatLngs(segments);
+
+    const current = segments[segments.length - 1];
+    if (showTrail && current && current.length > 1) {
+      startMarker.current.setLatLng(current[0]).addTo(m);
+    } else {
+      m.removeLayer(startMarker.current);
+    }
+  }, [track, showTrail]);
 
   useEffect(() => {
     const m = map.current;
     if (!m || !trail.current) return;
-    if (showTrail) {
-      trail.current.addTo(m);
-      trailGlow.current.addTo(m);
-    } else {
-      m.removeLayer(trail.current);
-      m.removeLayer(trailGlow.current);
-    }
+    [trailGlow.current, trail.current].forEach((l) => (showTrail ? l.addTo(m) : m.removeLayer(l)));
   }, [showTrail]);
 
   useEffect(() => {
@@ -175,18 +218,29 @@ export default function App() {
     return () => clearTimeout(t);
   }, [fullscreen, showLogs]);
 
-  const placeMarker = useCallback((point, { jump = false } = {}) => {
+  const placeMarker = useCallback((point, source) => {
     const m = map.current;
     if (!m || !marker.current) return;
+    if (!point) {
+      m.removeLayer(marker.current);
+      m.removeLayer(accuracy.current);
+      lastSource.current = null;
+      return;
+    }
     const ll = [point.latitude, point.longitude];
     if (!m.hasLayer(marker.current)) {
       marker.current.addTo(m);
       accuracy.current.addTo(m);
     }
     marker.current.setLatLng(ll);
-    accuracy.current.setLatLng(ll);
-    if (jump) m.setView(ll, 17);
-    else if (autoRecenterRef.current) m.panTo(ll, { animate: true, duration: 0.8 });
+    accuracy.current.setLatLng(ll).setRadius(point.accuracy || 12);
+    if (lastSource.current !== source) {
+      // jump straight there when the location first appears or switches laptop <-> device
+      lastSource.current = source;
+      m.setView(ll, 18);
+    } else if (autoRecenterRef.current) {
+      m.panTo(ll, { animate: true, duration: 0.8 });
+    }
   }, []);
 
   const handleNewPoint = useCallback(
@@ -196,14 +250,11 @@ export default function App() {
       setHistory((prev) => {
         const last = prev[prev.length - 1];
         if (last && last.timestamp === point.timestamp) return prev;
-        trail.current?.addLatLng([point.latitude, point.longitude]);
-        trailGlow.current?.addLatLng([point.latitude, point.longitude]);
         const next = [...prev, point];
         return next.length > MAX_POINTS ? next.slice(-MAX_POINTS) : next;
       });
-      placeMarker(point);
     },
-    [placeMarker]
+    []
   );
 
   // ---------- Data: initial fetch + SSE + polling backup ----------
@@ -215,15 +266,9 @@ export default function App() {
       .then((r) => r.json())
       .then((data) => {
         if (!alive) return;
-        const pts = Array.isArray(data.history) ? data.history : [];
-        setHistory(pts);
-        const ll = pts.map((p) => [p.latitude, p.longitude]);
-        trail.current?.setLatLngs(ll);
-        trailGlow.current?.setLatLngs(ll);
-        if (data.latest) {
-          setLatestPoint(data.latest);
-          placeMarker(data.latest, { jump: true });
-        }
+        setHistory(Array.isArray(data.history) ? data.history : []);
+        if (data.latest) setLatestPoint(data.latest);
+        if (data.device) setDevice(data.device);
         setConnection('online');
       })
       .catch(() => alive && setConnection('offline'));
@@ -239,11 +284,14 @@ export default function App() {
           /* ignore malformed packet */
         }
       });
-      es.addEventListener('history_cleared', () => {
-        setHistory([]);
-        trail.current?.setLatLngs([]);
-        trailGlow.current?.setLatLngs([]);
+      es.addEventListener('device', (e) => {
+        try {
+          setDevice(JSON.parse(e.data));
+        } catch {
+          /* ignore malformed packet */
+        }
       });
+      es.addEventListener('history_cleared', () => setHistory([]));
       es.onerror = () => setConnection((c) => (c === 'online' ? 'connecting' : c));
     } catch {
       setConnection('offline');
@@ -254,6 +302,7 @@ export default function App() {
         .then((r) => r.json())
         .then((d) => {
           if (d.latest) handleNewPoint(d.latest);
+          if (d.device) setDevice(d.device);
           setConnection('online');
         })
         .catch(() => {});
@@ -264,24 +313,64 @@ export default function App() {
       es?.close();
       clearInterval(poll);
     };
-  }, [handleNewPoint, placeMarker]);
+  }, [handleNewPoint]);
 
   // re-render every second so "x s ago" stays live
   useEffect(() => {
-    const t = setInterval(() => setTick((n) => n + 1), 1000);
+    const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
+
+  // ---------- Derived ----------
+  // No location at all until the tracker is online. Online without a 3D fix -> this
+  // browser's location. Online with a 3D fix -> the tracker's own GPS position.
+  const deviceOnline = !!device?.lastSeen && now - new Date(device.lastSeen).getTime() < ONLINE_TIMEOUT_MS;
+  const hasFix =
+    deviceOnline &&
+    !!latestPoint &&
+    (latestPoint.satellites || 0) >= 4 &&
+    now - new Date(latestPoint.timestamp).getTime() < ONLINE_TIMEOUT_MS;
+  const live = hasFix ? latestPoint : null;
+  const source = !deviceOnline ? null : hasFix ? 'device' : 'laptop';
+  const position = source === 'device' ? live : source === 'laptop' ? laptopPos : null;
+
+  // Watch the browser's location only while it's the one being shown
+  useEffect(() => {
+    if (source !== 'laptop' || !navigator.geolocation) return;
+    const id = navigator.geolocation.watchPosition(
+      (pos) =>
+        setLaptopPos({
+          latitude: pos.coords.latitude,
+          longitude: pos.coords.longitude,
+          accuracy: Math.min(pos.coords.accuracy || 0, 2000)
+        }),
+      () => setLaptopPos(null),
+      { enableHighAccuracy: true, maximumAge: 10_000 }
+    );
+    return () => navigator.geolocation.clearWatch(id);
+  }, [source]);
+
+  useEffect(() => {
+    placeMarker(position, source);
+  }, [position?.latitude, position?.longitude, source, placeMarker]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---------- Actions ----------
   const recenter = () => {
     setAutoRecenter(true);
-    if (latestPoint) map.current?.setView([latestPoint.latitude, latestPoint.longitude], 17, { animate: true });
+    if (position) map.current?.setView([position.latitude, position.longitude], 18, { animate: true });
+  };
+
+  const fitTrip = () => {
+    const current = track.segments[track.segments.length - 1];
+    if (!current?.length) return;
+    setAutoRecenter(false);
+    map.current?.fitBounds(L.latLngBounds(current), { padding: [70, 70], maxZoom: 17 });
   };
 
   const copyCoords = () => {
-    if (!latestPoint) return;
+    if (!position) return;
     navigator.clipboard
-      .writeText(`${latestPoint.latitude.toFixed(6)}, ${latestPoint.longitude.toFixed(6)}`)
+      .writeText(`${position.latitude.toFixed(6)}, ${position.longitude.toFixed(6)}`)
       .then(() => {
         setCopied(true);
         setTimeout(() => setCopied(false), 1800);
@@ -295,9 +384,7 @@ export default function App() {
     } catch {
       /* local clear still applies */
     }
-    setHistory([]);
-    trail.current?.setLatLngs([]);
-    trailGlow.current?.setLatLngs([]);
+    setHistory(latestPoint ? [latestPoint] : []);
   };
 
   const simulate = async () => {
@@ -308,20 +395,18 @@ export default function App() {
     }
   };
 
-  // ---------- Derived ----------
-  const speed = latestPoint?.speed || 0;
-  const sats = latestPoint?.satellites || 0;
+  const speed = live?.speed || 0;
+  const sats = live?.satellites || 0;
   const fix = fixQuality(sats);
-  const totalKm = useMemo(() => {
-    let d = 0;
-    for (let i = 1; i < history.length; i++) {
-      d += haversineDistance(history[i - 1].latitude, history[i - 1].longitude, history[i].latitude, history[i].longitude);
-    }
-    return d;
-  }, [history]);
-
-  const statusText = { online: 'Live', connecting: 'Connecting', offline: 'Offline' }[connection];
-  const gmaps = latestPoint ? `https://www.google.com/maps?q=${latestPoint.latitude},${latestPoint.longitude}` : '#';
+  const km = track.km;
+  const isMoving = speed > 2;
+  const status =
+    connection === 'offline'
+      ? { cls: 'offline', text: 'Server offline' }
+      : deviceOnline
+      ? { cls: 'online', text: 'Live' }
+      : { cls: 'connecting', text: 'Tracker offline' };
+  const gmaps = position ? `https://www.google.com/maps?q=${position.latitude},${position.longitude}` : '#';
 
   return (
     <div className={`app ${fullscreen ? 'is-fullscreen' : ''}`}>
@@ -332,15 +417,18 @@ export default function App() {
           </div>
           <div>
             <h1>GeoPulse</h1>
-            <p>ESP8266 + Neo-6M live tracker</p>
+            <p>ESP8266 · Neo-6M live tracker</p>
           </div>
         </div>
 
         <div className="topbar-actions">
-          <span className={`status status-${connection}`}>
-            {connection === 'offline' ? <LuWifiOff /> : <LuWifi />}
+          <span className="last-seen">
+            <LuClock /> {timeAgo(device?.lastSeen)}
+          </span>
+          <span className={`status status-${status.cls}`}>
+            {deviceOnline ? <LuWifi /> : <LuWifiOff />}
+            {status.text}
             <i className="status-dot" />
-            {statusText}
           </span>
           <button className="btn" onClick={simulate} title="Send a simulated GPS packet">
             <LuPlay /> <span>Simulate</span>
@@ -353,75 +441,81 @@ export default function App() {
           <section className="card hero-card">
             <div className="card-head">
               <span className="icon blue"><LuMapPin /></span>
-              <span className="label">Position</span>
-              <button className="chip-btn" onClick={copyCoords} disabled={!latestPoint}>
-                {copied ? <LuCheck /> : <LuCopy />} {copied ? 'Copied' : 'Copy'}
+              <span className="label">Current position</span>
+              <button className="chip-btn" onClick={copyCoords} disabled={!position} title="Copy coordinates">
+                {copied ? <LuCheck /> : <LuCopy />}
               </button>
             </div>
             <div className="coords">
-              <div><small>LAT</small><b className="mono">{latestPoint ? latestPoint.latitude.toFixed(6) : '--.------'}</b></div>
-              <div><small>LNG</small><b className="mono">{latestPoint ? latestPoint.longitude.toFixed(6) : '--.------'}</b></div>
+              <div><small>Latitude</small><b className="mono">{position ? position.latitude.toFixed(6) : '--.------'}</b></div>
+              <div><small>Longitude</small><b className="mono">{position ? position.longitude.toFixed(6) : '--.------'}</b></div>
             </div>
-            <a className="link" href={gmaps} target="_blank" rel="noopener noreferrer">
-              Open in Google Maps <LuExternalLink />
-            </a>
+            <div className="hero-foot">
+              <span className={`tag tag-${isMoving ? 'green' : 'gray'}`}>
+                <i className="tag-dot" /> {isMoving ? 'Moving' : 'Stationary'}
+              </span>
+              <a className="link" href={gmaps} target="_blank" rel="noopener noreferrer">
+                Google Maps <LuExternalLink />
+              </a>
+            </div>
           </section>
 
           <div className="grid-2">
             <section className="card stat">
-              <div className="card-head">
-                <span className="icon green"><LuGauge /></span>
-                <span className="label">Speed</span>
-              </div>
+              <div className="stat-head"><span className="icon green"><LuGauge /></span>Speed</div>
               <div className="big"><b className="mono">{speed.toFixed(1)}</b><span>km/h</span></div>
               <div className="bar"><i style={{ width: `${Math.min(100, speed)}%` }} /></div>
-              <small className="muted">{speed > 2 ? 'Moving' : 'Stationary'} · {(speed * 0.621371).toFixed(1)} mph</small>
             </section>
 
             <section className="card stat">
-              <div className="card-head">
-                <span className="icon purple"><LuRadar /></span>
-                <span className="label">Satellites</span>
-              </div>
-              <div className="big"><b className="mono">{sats}</b><span>sats</span></div>
-              <div className="sat-bars">
-                {[1, 4, 7, 10].map((n, i) => (
-                  <i key={n} className={sats >= n ? 'on' : ''} style={{ height: 6 + i * 5 }} />
-                ))}
+              <div className="stat-head"><span className="icon purple"><LuRadar /></span>Satellites</div>
+              <div className="big">
+                <b className="mono">{sats}</b>
+                <div className="sat-bars">
+                  {[1, 4, 7, 10].map((n, i) => (
+                    <i key={n} className={sats >= n ? 'on' : ''} style={{ height: 5 + i * 4 }} />
+                  ))}
+                </div>
               </div>
               <span className={`tag tag-${fix.tone}`}>{fix.label}</span>
             </section>
 
             <section className="card stat">
-              <div className="card-head">
-                <span className="icon amber"><LuRoute /></span>
-                <span className="label">Distance</span>
+              <div className="stat-head">
+                <span className="icon amber"><LuRoute /></span>Distance
+                <button className="mini-btn" onClick={clearHistory} title="Clear trail history"><LuTrash2 /></button>
               </div>
-              <div className="big"><b className="mono">{totalKm < 1 ? (totalKm * 1000).toFixed(0) : totalKm.toFixed(2)}</b><span>{totalKm < 1 ? 'm' : 'km'}</span></div>
-              <small className="muted">{history.length} points logged</small>
-              <button className="link danger" onClick={clearHistory}><LuTrash2 /> Clear trail</button>
+              <div className="big">
+                <b className="mono">{km < 1 ? (km * 1000).toFixed(0) : km.toFixed(2)}</b>
+                <span>{km < 1 ? 'm' : 'km'}</span>
+              </div>
+              <small className="muted">{history.length} points</small>
             </section>
 
             <section className="card stat">
-              <div className="card-head">
-                <span className="icon teal"><LuMountain /></span>
-                <span className="label">Altitude</span>
-              </div>
-              <div className="big"><b className="mono">{latestPoint?.altitude ? latestPoint.altitude.toFixed(0) : '--'}</b><span>m</span></div>
+              <div className="stat-head"><span className="icon teal"><LuMountain /></span>Altitude</div>
+              <div className="big"><b className="mono">{live?.altitude ? live.altitude.toFixed(0) : '--'}</b><span>m</span></div>
               <small className="muted">above sea level</small>
             </section>
           </div>
 
-          <section className="card ping">
-            <span className="icon teal"><LuClock /></span>
-            <div>
-              <b>{timeAgo(latestPoint?.timestamp)}</b>
-              <small className="muted mono">
-                {latestPoint?.timestamp ? new Date(latestPoint.timestamp).toLocaleTimeString() : '--:--:--'}
-              </small>
-            </div>
-            <LuActivity className={`pulse ${connection === 'online' ? 'on' : ''}`} />
+          <section className="card recent">
+            <div className="stat-head"><span className="icon blue"><LuClock /></span>Recent pings</div>
+            {history.length === 0 ? (
+              <small className="muted">No packets yet.</small>
+            ) : (
+              <ul>
+                {history.slice(-5).reverse().map((p, i) => (
+                  <li key={`${p.timestamp}-${i}`}>
+                    <span className="mono">{p.timestamp ? new Date(p.timestamp).toLocaleTimeString() : '--'}</span>
+                    <span className="mono muted">{(p.speed || 0).toFixed(1)} km/h</span>
+                    <span className="mono muted">{p.satellites || 0} sats</span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </section>
+
         </aside>
 
         <main className="map-wrap">
@@ -439,6 +533,9 @@ export default function App() {
               <button className={`tool ${autoRecenter ? 'active' : ''}`} onClick={recenter} title="Follow tracker">
                 <LuLocateFixed />
               </button>
+              <button className="tool" onClick={fitTrip} title="Fit whole trip">
+                <LuScanSearch />
+              </button>
               <button className={`tool ${showTrail ? 'active' : ''}`} onClick={() => setShowTrail((v) => !v)} title="Toggle trail">
                 <LuSpline />
               </button>
@@ -448,12 +545,23 @@ export default function App() {
             </div>
           </div>
 
-          {!latestPoint && (
+          {live && (
+            <div className="map-hud">
+              <div><small>Speed</small><b className="mono">{speed.toFixed(1)}<em>km/h</em></b></div>
+              <div><small>Sats</small><b className="mono">{sats}</b></div>
+              <div><small>Trip</small><b className="mono">{km < 1 ? `${(km * 1000).toFixed(0)}` : km.toFixed(2)}<em>{km < 1 ? 'm' : 'km'}</em></b></div>
+            </div>
+          )}
+
+          {!position && (
             <div className="empty">
               <div className="radar"><i /><i /><i /><LuNavigation /></div>
-              <h3>Waiting for GPS coordinates</h3>
-              <p>Power the ESP8266 and keep the Neo-6M antenna under open sky. The first fix can take a few minutes.</p>
-              <button className="btn primary" onClick={simulate}><LuPlay /> Try simulated location</button>
+              <h3>{deviceOnline ? 'Getting location…' : 'Tracker offline'}</h3>
+              <p>
+                {deviceOnline
+                  ? 'Allow location access in your browser to see where you are while the GPS gets a fix.'
+                  : 'The location will appear once the ESP8266 connects to the internet.'}
+              </p>
             </div>
           )}
         </main>

@@ -28,6 +28,8 @@ const char* WIFI_PASSWORD = "123456789";      // Note: If your password literall
 // ================= RENDER BACKEND CONFIGURATION =================
 // Your deployed Render backend URL:
 const char* SERVER_URL    = "https://gps-tracker-m6wx.onrender.com/api/location";
+// Sent while there is no GPS fix, so the dashboard knows the tracker is online
+const char* HEARTBEAT_URL = "https://gps-tracker-m6wx.onrender.com/api/heartbeat";
 
 // Must match the API_KEY set in your backend environment
 const char* API_KEY       = "YOUR_SECRET_API_KEY";
@@ -102,6 +104,26 @@ void printCoordinatesToSerial(double lat, double lng, double speedKmph, int sats
   Serial.println("==================================================");
 }
 
+void sendHeartbeat(int sats) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  if (!http.begin(client, HEARTBEAT_URL)) {
+    Serial.println("❌ Could not initialize heartbeat connection");
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-api-key", API_KEY);
+
+  int httpCode = http.POST("{\"satellites\":" + String(sats) + "}");
+  Serial.print("💓 Heartbeat sent (no fix), response: ");
+  Serial.println(httpCode);
+
+  http.end();
+}
+
 void sendGPSLocation() {
   // Check WiFi connection
   if (WiFi.status() != WL_CONNECTED) {
@@ -118,6 +140,7 @@ void sendGPSLocation() {
     Serial.print(", Chars decoded: ");
     Serial.print(gps.charsProcessed());
     Serial.println(")");
+    sendHeartbeat(sats);
     return;
   }
 

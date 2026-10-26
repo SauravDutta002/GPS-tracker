@@ -21,6 +21,9 @@ let latestLocation = null;
 const locationHistory = [];
 const MAX_HISTORY = 500;
 
+// Last time the ESP8266 talked to us (heartbeat or fix), and whether it had a fix
+const deviceStatus = { lastSeen: null, hasFix: false, satellites: 0 };
+
 // Connected SSE clients for real-time live streaming
 const clients = new Set();
 
@@ -45,14 +48,15 @@ const rawFrontendPath = path.join(__dirname, '..', 'frontend');
 const frontendPath = fs.existsSync(distPath) ? distPath : rawFrontendPath;
 app.use(express.static(frontendPath));
 
-// Health check endpoint (for Render uptime & liveness probes)
-app.get('/api/health', (req, res) => {
+// Health check endpoint (for Render uptime, liveness probes & cron keep-alive pings)
+app.get(['/health', '/api/health'], (req, res) => {
   res.json({
     status: 'online',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     connectedClients: clients.size,
-    hasLocation: !!latestLocation
+    hasLocation: !!latestLocation,
+    device: deviceStatus
   });
 });
 
@@ -97,6 +101,8 @@ app.post('/api/location', verifyApiKey, (req, res) => {
 
   latestLocation = point;
   locationHistory.push(point);
+  Object.assign(deviceStatus, { lastSeen: point.timestamp, hasFix: true, satellites: point.satellites });
+  broadcastSSE('device', deviceStatus);
 
   // Keep history bounded
   if (locationHistory.length > MAX_HISTORY) {
@@ -116,6 +122,18 @@ app.post('/api/location', verifyApiKey, (req, res) => {
 });
 
 /**
+ * POST /api/heartbeat
+ * ESP8266 is online but has no GPS fix yet
+ * Body: { satellites }
+ */
+app.post('/api/heartbeat', verifyApiKey, (req, res) => {
+  const satellites = Number(req.body?.satellites) || 0;
+  Object.assign(deviceStatus, { lastSeen: new Date().toISOString(), hasFix: false, satellites });
+  broadcastSSE('device', deviceStatus);
+  res.json({ success: true, device: deviceStatus });
+});
+
+/**
  * GET /api/location
  * Returns the current location and recent route history
  */
@@ -123,6 +141,7 @@ app.get('/api/location', (req, res) => {
   res.json({
     success: true,
     latest: latestLocation,
+    device: deviceStatus,
     history: locationHistory,
     totalPoints: locationHistory.length
   });
@@ -142,6 +161,11 @@ app.get('/api/location/stream', (req, res) => {
 
   // Send an immediate initial handshake
   res.write(`event: connected\ndata: ${JSON.stringify({ status: 'connected', clients: clients.size + 1 })}\n\n`);
+
+  res.write(`event: device
+data: ${JSON.stringify(deviceStatus)}
+
+`);
 
   // If there's an existing latest location, send it right away
   if (latestLocation) {
@@ -198,6 +222,8 @@ app.post('/api/simulate', (req, res) => {
   latestLocation = simulatedPoint;
   locationHistory.push(simulatedPoint);
   if (locationHistory.length > MAX_HISTORY) locationHistory.shift();
+  Object.assign(deviceStatus, { lastSeen: simulatedPoint.timestamp, hasFix: true, satellites: simulatedPoint.satellites });
+  broadcastSSE('device', deviceStatus);
 
   broadcastSSE('location', simulatedPoint);
 
