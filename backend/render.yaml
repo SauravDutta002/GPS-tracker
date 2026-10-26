@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: gps-tracker-backend
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node server.js
+    envVars:
+      - key: API_KEY
+        value: YOUR_SECRET_API_KEY
+      - key: PORT
+        value: 10000

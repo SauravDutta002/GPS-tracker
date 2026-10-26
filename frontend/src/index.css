@@ -1,5 +1,5 @@
 /* =========================================================
-   GeoPulse Live GPS Dashboard - Modern White Theme
+   GeoPulse Live GPS Dashboard - Modern White Theme (React)
    ========================================================= */
 
 :root {
@@ -114,11 +114,6 @@ body {
   box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);
 }
 
-.satellite-icon {
-  width: 24px;
-  height: 24px;
-}
-
 .live-pulse-ring {
   position: absolute;
   top: -3px;
@@ -222,7 +217,13 @@ body {
   to { opacity: 1; }
 }
 
-/* Buttons */
+/* Header Action Buttons */
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
@@ -235,11 +236,6 @@ body {
   border: 1px solid transparent;
   transition: all 0.2s ease;
   font-family: inherit;
-}
-
-.btn svg {
-  width: 16px;
-  height: 16px;
 }
 
 .btn-primary {
@@ -279,6 +275,7 @@ body {
   color: var(--text-secondary);
   border: none;
   padding: 4px 8px;
+  cursor: pointer;
 }
 .btn-subtle:hover {
   color: var(--primary);
@@ -318,11 +315,6 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-}
-
-.card-icon svg {
-  width: 18px;
-  height: 18px;
 }
 
 .card-icon.blue { background: var(--primary-light); color: var(--primary); }
@@ -366,7 +358,6 @@ body {
   gap: 4px;
   transition: all 0.2s;
 }
-.copy-chip svg { width: 12px; height: 12px; }
 .copy-chip:hover {
   background: var(--primary-light);
   color: var(--primary);
@@ -454,8 +445,6 @@ body {
 .satellite-signal-bars .bar-3 { height: 75%; }
 .satellite-signal-bars .bar-4 { height: 100%; }
 
-.signal-active .bar { background: var(--purple); }
-
 /* Progress bar for speed */
 .progress-bar-bg {
   width: 100%;
@@ -496,7 +485,6 @@ body {
   align-items: center;
   gap: 4px;
 }
-.footer-link svg { width: 14px; height: 14px; }
 .footer-link:hover { text-decoration: underline; }
 
 .link-btn {
@@ -523,7 +511,7 @@ body {
   overflow: hidden;
 }
 
-#map {
+.leaflet-container {
   width: 100%;
   height: 100%;
   background: #f8fafc;
@@ -567,8 +555,6 @@ body {
   box-shadow: var(--shadow-md);
   transition: all 0.2s ease;
 }
-
-.map-btn svg { width: 15px; height: 15px; }
 
 .map-btn:hover {
   background: #ffffff;
@@ -627,12 +613,6 @@ body {
   text-align: center;
   padding: 24px;
   transition: opacity 0.4s ease, visibility 0.4s;
-}
-
-.map-empty-overlay.hidden {
-  opacity: 0;
-  visibility: hidden;
-  pointer-events: none;
 }
 
 .empty-state-box {
@@ -748,8 +728,6 @@ body {
 }
 
 .logs-title svg {
-  width: 18px;
-  height: 18px;
   color: var(--primary);
 }
 
@@ -769,8 +747,6 @@ body {
 }
 
 .chevron {
-  width: 16px;
-  height: 16px;
   transition: transform 0.2s;
 }
 
@@ -778,10 +754,6 @@ body {
   margin-top: 14px;
   overflow-x: auto;
   transition: all 0.3s ease;
-}
-
-.logs-body.collapsed {
-  display: none;
 }
 
 .logs-table {
@@ -828,14 +800,6 @@ body {
   align-items: center;
   justify-content: center;
   padding: 16px;
-  opacity: 0;
-  visibility: hidden;
-  transition: opacity 0.2s ease, visibility 0.2s;
-}
-
-.modal-backdrop.show {
-  opacity: 1;
-  visibility: visible;
 }
 
 .modal-card {
@@ -846,12 +810,12 @@ body {
   box-shadow: var(--shadow-xl);
   overflow: hidden;
   border: 1px solid var(--border-color);
-  transform: translateY(12px);
-  transition: transform 0.2s ease;
+  animation: modalEnter 0.2s ease;
 }
 
-.modal-backdrop.show .modal-card {
-  transform: translateY(0);
+@keyframes modalEnter {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .modal-header {

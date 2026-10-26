@@ -37,8 +37,12 @@ function broadcastSSE(eventType, data) {
   }
 }
 
-// Serve Frontend static files directly from the same Render deployment
-const frontendPath = path.join(__dirname, '..', 'frontend');
+const fs = require('fs');
+
+// Serve React production build from dist if available, else fallback to frontend
+const distPath = path.join(__dirname, '..', 'frontend', 'dist');
+const rawFrontendPath = path.join(__dirname, '..', 'frontend');
+const frontendPath = fs.existsSync(distPath) ? distPath : rawFrontendPath;
 app.use(express.static(frontendPath));
 
 // Health check endpoint (for Render uptime & liveness probes)

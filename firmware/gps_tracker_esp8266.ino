@@ -21,9 +21,9 @@
 #include <TinyGPSPlus.h>
 
 // ================= WIFI CONFIGURATION =================
-// Replace with your WiFi network credentials
-const char* WIFI_SSID     = "YOUR_WIFI_NAME";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+// Configured with your WiFi credentials:
+const char* WIFI_SSID     = "IOT";            // Change if your WiFi name/hotspot is different
+const char* WIFI_PASSWORD = "123456789";      // Note: If your password literally includes 'IOT ', change to "IOT 123456789"
 
 // ================= RENDER BACKEND CONFIGURATION =================
 // Replace with your deployed Render backend URL or local IP:
