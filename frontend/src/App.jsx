@@ -1,791 +1,496 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import L from 'leaflet';
 import {
-  Satellite,
-  MapPin,
-  Gauge,
-  Clock,
-  Settings,
-  Play,
-  Copy,
-  Check,
-  ExternalLink,
-  Crosshair,
-  Trash2,
-  ChevronDown,
-  ChevronUp,
-  X,
-  Compass
-} from 'lucide-react';
+  LuSatellite,
+  LuMapPin,
+  LuGauge,
+  LuClock,
+  LuRoute,
+  LuMountain,
+  LuCopy,
+  LuCheck,
+  LuExternalLink,
+  LuLocateFixed,
+  LuTrash2,
+  LuChevronUp,
+  LuChevronDown,
+  LuPlay,
+  LuMaximize,
+  LuMinimize,
+  LuNavigation,
+  LuWifi,
+  LuWifiOff,
+  LuActivity,
+  LuSpline,
+  LuRadar
+} from 'react-icons/lu';
+import { BACKEND_URL, API_KEY } from './config';
 
-// Haversine distance helper
+const MAX_POINTS = 500;
+const jsonHeaders = { 'Content-Type': 'application/json', 'x-api-key': API_KEY };
+
 function haversineDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Earth's radius in km
+  const R = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
   const dLon = ((lon2 - lon1) * Math.PI) / 180;
   const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+function fixQuality(sats) {
+  if (sats >= 8) return { label: 'Strong fix', tone: 'green' };
+  if (sats >= 4) return { label: 'Good fix', tone: 'blue' };
+  if (sats > 0) return { label: 'Weak fix', tone: 'amber' };
+  return { label: 'Searching', tone: 'gray' };
+}
+
+function timeAgo(timestamp) {
+  if (!timestamp) return 'Waiting for data';
+  const s = Math.max(0, Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000));
+  if (s < 3) return 'Just now';
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s ago`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ago`;
+}
+
+const LAYERS = [
+  { key: 'dark', label: 'Dark' },
+  { key: 'streets', label: 'Streets' },
+  { key: 'satellite', label: 'Satellite' }
+];
+
 export default function App() {
-  // Backend URL resolution
-  const [backendUrl, setBackendUrl] = useState(() => {
-    const saved = localStorage.getItem('gps_backend_url');
-    if (saved && saved.trim() !== '') return saved.trim().replace(/\/$/, '');
-    if (window.location.protocol.startsWith('http')) {
-      // In dev mode (port 5173), default to localhost:3000
-      if (window.location.port === '5173') return 'http://localhost:3000';
-      return window.location.origin;
-    }
-    return 'http://localhost:3000';
-  });
-
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('gps_api_key') || '');
-
-  // State
   const [latestPoint, setLatestPoint] = useState(null);
   const [history, setHistory] = useState([]);
-  const [connectionStatus, setConnectionStatus] = useState('connecting'); // 'online' | 'connecting' | 'offline'
+  const [connection, setConnection] = useState('connecting'); // online | connecting | offline
   const [autoRecenter, setAutoRecenter] = useState(true);
   const [showTrail, setShowTrail] = useState(true);
-  const [currentLayer, setCurrentLayer] = useState('positron');
+  const [layer, setLayer] = useState('dark');
   const [copied, setCopied] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
-  const [lastPingAgo, setLastPingAgo] = useState('Waiting for data');
+  const [fullscreen, setFullscreen] = useState(false);
+  const [, setTick] = useState(0);
 
-  // Input states in settings modal
-  const [tempUrl, setTempUrl] = useState(backendUrl);
-  const [tempKey, setTempKey] = useState(apiKey);
+  const mapEl = useRef(null);
+  const map = useRef(null);
+  const marker = useRef(null);
+  const accuracy = useRef(null);
+  const trail = useRef(null);
+  const trailGlow = useRef(null);
+  const tiles = useRef({});
+  const autoRecenterRef = useRef(true);
 
-  // Map Refs
-  const mapContainerRef = useRef(null);
-  const mapInstanceRef = useRef(null);
-  const markerRef = useRef(null);
-  const polylineRef = useRef(null);
-  const tileLayersRef = useRef({});
-
-  // 1. Initialize Leaflet Map
   useEffect(() => {
-    if (!mapContainerRef.current || mapInstanceRef.current) return;
+    autoRecenterRef.current = autoRecenter;
+  }, [autoRecenter]);
 
-    const defaultCoords = [28.6139, 77.2090]; // Delhi India Gate default
-    const map = L.map(mapContainerRef.current, {
-      center: defaultCoords,
-      zoom: 15,
-      zoomControl: false
+  // ---------- Map ----------
+  useEffect(() => {
+    if (!mapEl.current || map.current) return;
+
+    const m = L.map(mapEl.current, {
+      center: [20.5937, 78.9629],
+      zoom: 5,
+      zoomControl: false,
+      zoomSnap: 0.5,
+      attributionControl: true
     });
+    L.control.zoom({ position: 'bottomright' }).addTo(m);
+    L.control.scale({ position: 'bottomleft', imperial: false }).addTo(m);
 
-    L.control.zoom({ position: 'bottomright' }).addTo(map);
-
-    // Map Tile Layers
-    const layers = {
-      positron: L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    const carto = (style) =>
+      L.tileLayer(`https://{s}.basemaps.cartocdn.com/${style}/{z}/{x}/{y}{r}.png`, {
         attribution: '&copy; OpenStreetMap &copy; CARTO',
         subdomains: 'abcd',
         maxZoom: 20
-      }),
-      osm: L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap',
-        maxZoom: 19
-      }),
-      satellite: L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-        attribution: 'Tiles &copy; Esri',
-        maxZoom: 19
-      })
+      });
+
+    tiles.current = {
+      dark: carto('dark_all'),
+      streets: carto('rastertiles/voyager'),
+      satellite: L.layerGroup([
+        L.tileLayer(
+          'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+          { attribution: 'Tiles &copy; Esri', maxZoom: 19 }
+        ),
+        L.tileLayer(
+          'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+          { maxZoom: 19 }
+        )
+      ])
     };
+    tiles.current.dark.addTo(m);
 
-    layers.positron.addTo(map);
-    tileLayersRef.current = layers;
+    trailGlow.current = L.polyline([], { color: '#38bdf8', weight: 10, opacity: 0.18, lineCap: 'round' }).addTo(m);
+    trail.current = L.polyline([], { color: '#38bdf8', weight: 4, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }).addTo(m);
+    accuracy.current = L.circle([0, 0], { radius: 15, color: '#38bdf8', weight: 1, fillColor: '#38bdf8', fillOpacity: 0.12 });
 
-    // Trail Polyline
-    const polyline = L.polyline([], {
-      color: '#2563eb',
-      weight: 4,
-      opacity: 0.85,
-      lineJoin: 'round'
-    }).addTo(map);
-    polylineRef.current = polyline;
-
-    // Animated GPS Beacon Marker
-    const customIcon = L.divIcon({
-      className: 'custom-gps-marker',
-      html: `
-        <div class="marker-ripple"></div>
-        <div class="marker-beacon"></div>
-      `,
-      iconSize: [24, 24],
-      iconAnchor: [12, 12]
+    marker.current = L.marker([0, 0], {
+      icon: L.divIcon({
+        className: 'gps-marker',
+        html: '<span class="gps-ripple"></span><span class="gps-ripple r2"></span><span class="gps-dot"></span>',
+        iconSize: [28, 28],
+        iconAnchor: [14, 14]
+      }),
+      zIndexOffset: 1000
     });
 
-    const marker = L.marker(defaultCoords, { icon: customIcon });
-    markerRef.current = marker;
-
-    // Turn off auto-recenter when user drags map manually
-    map.on('dragstart', () => {
-      setAutoRecenter(false);
-    });
-
-    mapInstanceRef.current = map;
+    m.on('dragstart', () => setAutoRecenter(false));
+    map.current = m;
 
     return () => {
-      map.remove();
-      mapInstanceRef.current = null;
+      m.remove();
+      map.current = null;
     };
   }, []);
 
-  // 2. Switch Map Tile Layers
-  const handleLayerChange = (layerKey) => {
-    const map = mapInstanceRef.current;
-    if (!map) return;
-    const layers = tileLayersRef.current;
-
-    if (layers[currentLayer]) map.removeLayer(layers[currentLayer]);
-    if (layers[layerKey]) layers[layerKey].addTo(map);
-    setCurrentLayer(layerKey);
-  };
-
-  // 3. Connect to Server-Sent Events (SSE) & Initial Fetch
-  const handleNewPoint = useCallback((point) => {
-    if (!point || typeof point.latitude !== 'number' || typeof point.longitude !== 'number') return;
-
-    setLatestPoint(point);
-    setHistory(prev => {
-      const updated = [...prev, point];
-      // Keep up to 500 points
-      return updated.length > 500 ? updated.slice(-500) : updated;
+  useEffect(() => {
+    const m = map.current;
+    if (!m) return;
+    Object.entries(tiles.current).forEach(([key, l]) => {
+      if (key === layer) l.addTo(m);
+      else m.removeLayer(l);
     });
+    // keep trail above imagery
+    trailGlow.current?.bringToFront();
+    trail.current?.bringToFront();
+  }, [layer]);
 
-    // Update map marker
-    const map = mapInstanceRef.current;
-    const marker = markerRef.current;
-    const polyline = polylineRef.current;
-
-    if (map && marker) {
-      const latLng = [point.latitude, point.longitude];
-      if (!map.hasLayer(marker)) {
-        marker.addTo(map);
-      }
-      marker.setLatLng(latLng);
-
-      if (polyline) {
-        polyline.addLatLng(latLng);
-      }
-
-      // Pan to new coordinate if auto-recenter is enabled
-      setAutoRecenter(current => {
-        if (current) {
-          map.panTo(latLng, { animate: true, duration: 0.8 });
-        }
-        return current;
-      });
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !trail.current) return;
+    if (showTrail) {
+      trail.current.addTo(m);
+      trailGlow.current.addTo(m);
+    } else {
+      m.removeLayer(trail.current);
+      m.removeLayer(trailGlow.current);
     }
+  }, [showTrail]);
+
+  useEffect(() => {
+    const t = setTimeout(() => map.current?.invalidateSize(), 250);
+    return () => clearTimeout(t);
+  }, [fullscreen, showLogs]);
+
+  const placeMarker = useCallback((point, { jump = false } = {}) => {
+    const m = map.current;
+    if (!m || !marker.current) return;
+    const ll = [point.latitude, point.longitude];
+    if (!m.hasLayer(marker.current)) {
+      marker.current.addTo(m);
+      accuracy.current.addTo(m);
+    }
+    marker.current.setLatLng(ll);
+    accuracy.current.setLatLng(ll);
+    if (jump) m.setView(ll, 17);
+    else if (autoRecenterRef.current) m.panTo(ll, { animate: true, duration: 0.8 });
   }, []);
 
-  // Initial Fetch & SSE Setup
+  const handleNewPoint = useCallback(
+    (point) => {
+      if (!point || typeof point.latitude !== 'number' || typeof point.longitude !== 'number') return;
+      setLatestPoint(point);
+      setHistory((prev) => {
+        const last = prev[prev.length - 1];
+        if (last && last.timestamp === point.timestamp) return prev;
+        trail.current?.addLatLng([point.latitude, point.longitude]);
+        trailGlow.current?.addLatLng([point.latitude, point.longitude]);
+        const next = [...prev, point];
+        return next.length > MAX_POINTS ? next.slice(-MAX_POINTS) : next;
+      });
+      placeMarker(point);
+    },
+    [placeMarker]
+  );
+
+  // ---------- Data: initial fetch + SSE + polling backup ----------
   useEffect(() => {
-    let eventSource = null;
-    let pollTimer = null;
+    let es;
+    let alive = true;
 
-    const streamUrl = `${backendUrl}/api/location/stream`;
-    setConnectionStatus('connecting');
-
-    // Initial fetch of existing points
-    fetch(`${backendUrl}/api/location`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.history && Array.isArray(data.history) && data.history.length > 0) {
-          setHistory(data.history);
-          if (polylineRef.current) {
-            polylineRef.current.setLatLngs(data.history.map(p => [p.latitude, p.longitude]));
-          }
-        }
+    fetch(`${BACKEND_URL}/api/location`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (!alive) return;
+        const pts = Array.isArray(data.history) ? data.history : [];
+        setHistory(pts);
+        const ll = pts.map((p) => [p.latitude, p.longitude]);
+        trail.current?.setLatLngs(ll);
+        trailGlow.current?.setLatLngs(ll);
         if (data.latest) {
           setLatestPoint(data.latest);
-          if (markerRef.current && mapInstanceRef.current) {
-            markerRef.current.addTo(mapInstanceRef.current);
-            markerRef.current.setLatLng([data.latest.latitude, data.latest.longitude]);
-            mapInstanceRef.current.setView([data.latest.latitude, data.latest.longitude], 15);
-          }
+          placeMarker(data.latest, { jump: true });
         }
+        setConnection('online');
       })
-      .catch(err => console.warn('Could not fetch initial location:', err.message));
+      .catch(() => alive && setConnection('offline'));
 
-    // Connect SSE
     try {
-      eventSource = new EventSource(streamUrl);
-
-      eventSource.addEventListener('connected', () => {
-        setConnectionStatus('online');
-      });
-
-      eventSource.addEventListener('location', (e) => {
+      es = new EventSource(`${BACKEND_URL}/api/location/stream`);
+      es.addEventListener('connected', () => setConnection('online'));
+      es.addEventListener('location', (e) => {
         try {
-          const point = JSON.parse(e.data);
-          handleNewPoint(point);
-          setConnectionStatus('online');
-        } catch (err) {
-          console.error('Error parsing SSE location:', err);
+          handleNewPoint(JSON.parse(e.data));
+          setConnection('online');
+        } catch {
+          /* ignore malformed packet */
         }
       });
-
-      eventSource.addEventListener('history_cleared', () => {
+      es.addEventListener('history_cleared', () => {
         setHistory([]);
-        if (polylineRef.current) {
-          polylineRef.current.setLatLngs([]);
-        }
+        trail.current?.setLatLngs([]);
+        trailGlow.current?.setLatLngs([]);
       });
-
-      eventSource.onerror = () => {
-        setConnectionStatus('connecting');
-      };
-    } catch (err) {
-      console.error('EventSource failed:', err);
-      setConnectionStatus('offline');
+      es.onerror = () => setConnection((c) => (c === 'online' ? 'connecting' : c));
+    } catch {
+      setConnection('offline');
     }
 
-    // Polling backup every 6s
-    pollTimer = setInterval(() => {
-      fetch(`${backendUrl}/api/location`)
-        .then(r => r.json())
-        .then(d => {
+    const poll = setInterval(() => {
+      fetch(`${BACKEND_URL}/api/location`)
+        .then((r) => r.json())
+        .then((d) => {
           if (d.latest) handleNewPoint(d.latest);
+          setConnection('online');
         })
         .catch(() => {});
     }, 6000);
 
     return () => {
-      if (eventSource) eventSource.close();
-      if (pollTimer) clearInterval(pollTimer);
+      alive = false;
+      es?.close();
+      clearInterval(poll);
     };
-  }, [backendUrl, handleNewPoint]);
+  }, [handleNewPoint, placeMarker]);
 
-  // 4. Live "Last Updated" Counter
+  // re-render every second so "x s ago" stays live
   useEffect(() => {
-    const timer = setInterval(() => {
-      if (!latestPoint || !latestPoint.timestamp) {
-        setLastPingAgo('Waiting for data');
-        return;
-      }
-      const seconds = Math.floor((Date.now() - new Date(latestPoint.timestamp).getTime()) / 1000);
-      if (seconds < 2) {
-        setLastPingAgo('Just now');
-      } else if (seconds < 60) {
-        setLastPingAgo(`${seconds}s ago`);
-      } else {
-        const mins = Math.floor(seconds / 60);
-        setLastPingAgo(`${mins}m ${seconds % 60}s ago`);
-      }
-    }, 1000);
+    const t = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
 
-    return () => clearInterval(timer);
-  }, [latestPoint]);
-
-  // Recenter map button
-  const handleRecenter = () => {
+  // ---------- Actions ----------
+  const recenter = () => {
     setAutoRecenter(true);
-    if (latestPoint && mapInstanceRef.current) {
-      mapInstanceRef.current.setView([latestPoint.latitude, latestPoint.longitude], 16, { animate: true });
-    }
+    if (latestPoint) map.current?.setView([latestPoint.latitude, latestPoint.longitude], 17, { animate: true });
   };
 
-  // Toggle Trail
-  const handleToggleTrail = () => {
-    const map = mapInstanceRef.current;
-    const polyline = polylineRef.current;
-    if (!map || !polyline) return;
-
-    if (showTrail) {
-      map.removeLayer(polyline);
-      setShowTrail(false);
-    } else {
-      polyline.addTo(map);
-      setShowTrail(true);
-    }
-  };
-
-  // Copy coordinates
-  const handleCopyCoords = () => {
+  const copyCoords = () => {
     if (!latestPoint) return;
-    const text = `${latestPoint.latitude.toFixed(6)}, ${latestPoint.longitude.toFixed(6)}`;
-    navigator.clipboard.writeText(text).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
+    navigator.clipboard
+      .writeText(`${latestPoint.latitude.toFixed(6)}, ${latestPoint.longitude.toFixed(6)}`)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1800);
+      });
   };
 
-  // Clear history
-  const handleClearHistory = async () => {
-    if (!window.confirm('Are you sure you want to clear route trail history?')) return;
+  const clearHistory = async () => {
+    if (!window.confirm('Clear the route trail history?')) return;
     try {
-      await fetch(`${backendUrl}/api/location/history`, { method: 'DELETE' });
-    } catch (err) {
-      console.error('Failed to clear history:', err);
+      await fetch(`${BACKEND_URL}/api/location/history`, { method: 'DELETE', headers: jsonHeaders });
+    } catch {
+      /* local clear still applies */
     }
     setHistory([]);
-    if (polylineRef.current) polylineRef.current.setLatLngs([]);
+    trail.current?.setLatLngs([]);
+    trailGlow.current?.setLatLngs([]);
   };
 
-  // Simulate ping
-  const handleSimulate = async () => {
+  const simulate = async () => {
     try {
-      await fetch(`${backendUrl}/api/simulate`, { method: 'POST' });
+      await fetch(`${BACKEND_URL}/api/simulate`, { method: 'POST', headers: jsonHeaders });
     } catch (err) {
-      alert(`Simulation failed: ${err.message}. Ensure backend is running.`);
+      alert(`Simulation failed: ${err.message}`);
     }
   };
 
-  // Save Settings Modal
-  const handleSaveSettings = () => {
-    const cleanUrl = tempUrl.trim();
-    const cleanKey = tempKey.trim();
-
-    if (cleanUrl) {
-      localStorage.setItem('gps_backend_url', cleanUrl);
-      setBackendUrl(cleanUrl);
-    } else {
-      localStorage.removeItem('gps_backend_url');
-      setBackendUrl(window.location.origin);
-    }
-
-    if (cleanKey) {
-      localStorage.setItem('gps_api_key', cleanKey);
-      setApiKey(cleanKey);
-    } else {
-      localStorage.removeItem('gps_api_key');
-      setApiKey('');
-    }
-
-    setShowSettings(false);
-  };
-
-  // Reset Settings
-  const handleResetSettings = () => {
-    localStorage.removeItem('gps_backend_url');
-    localStorage.removeItem('gps_api_key');
-    const defUrl = window.location.port === '5173' ? 'http://localhost:3000' : window.location.origin;
-    setTempUrl(defUrl);
-    setTempKey('');
-    setBackendUrl(defUrl);
-    setApiKey('');
-  };
-
-  // Derived metrics
-  const speedKmph = latestPoint?.speed || 0;
-  const speedMph = (speedKmph * 0.621371).toFixed(1);
-  const speedBarWidth = Math.min(100, Math.max(0, (speedKmph / 100) * 100));
-
-  let totalDistanceKm = 0;
-  for (let i = 1; i < history.length; i++) {
-    totalDistanceKm += haversineDistance(
-      history[i - 1].latitude,
-      history[i - 1].longitude,
-      history[i].latitude,
-      history[i].longitude
-    );
-  }
-
+  // ---------- Derived ----------
+  const speed = latestPoint?.speed || 0;
   const sats = latestPoint?.satellites || 0;
-  let fixQualityText = 'Searching';
-  let fixQualityClass = 'chip-gray';
-  if (sats >= 8) {
-    fixQualityText = 'Strong 3D Fix';
-    fixQualityClass = 'chip-green';
-  } else if (sats >= 4) {
-    fixQualityText = 'Good Fix';
-    fixQualityClass = 'chip-blue';
-  } else if (sats > 0) {
-    fixQualityText = 'Weak Fix';
-    fixQualityClass = 'chip-amber';
-  }
+  const fix = fixQuality(sats);
+  const totalKm = useMemo(() => {
+    let d = 0;
+    for (let i = 1; i < history.length; i++) {
+      d += haversineDistance(history[i - 1].latitude, history[i - 1].longitude, history[i].latitude, history[i].longitude);
+    }
+    return d;
+  }, [history]);
 
-  const gmapsUrl = latestPoint
-    ? `https://www.google.com/maps?q=${latestPoint.latitude},${latestPoint.longitude}`
-    : '#';
+  const statusText = { online: 'Live', connecting: 'Connecting', offline: 'Offline' }[connection];
+  const gmaps = latestPoint ? `https://www.google.com/maps?q=${latestPoint.latitude},${latestPoint.longitude}` : '#';
 
   return (
-    <div className="app-container">
-      {/* Top Navbar */}
-      <header className="top-nav">
-        <div className="nav-left">
-          <div className="logo-box">
-            <Satellite className="satellite-icon" />
-            <span className="live-pulse-ring"></span>
+    <div className={`app ${fullscreen ? 'is-fullscreen' : ''}`}>
+      <header className="topbar">
+        <div className="brand">
+          <div className="brand-logo">
+            <LuSatellite />
           </div>
-          <div className="brand-text">
-            <h1>GeoPulse <span>React Live</span></h1>
-            <p className="subtitle">ESP8266 + Neo-6M GPS Telemetry Dashboard</p>
+          <div>
+            <h1>GeoPulse</h1>
+            <p>ESP8266 + Neo-6M live tracker</p>
           </div>
         </div>
 
-        <div className="nav-right">
-          {/* Connection Status Pill */}
-          <div className={`status-pill status-${connectionStatus}`}>
-            <span className="pill-dot"></span>
-            <span className="pill-text">
-              {connectionStatus === 'online'
-                ? 'LIVE CONNECTED'
-                : connectionStatus === 'connecting'
-                ? 'Connecting...'
-                : 'OFFLINE'}
-            </span>
-          </div>
-
-          <div className="header-actions">
-            <button onClick={handleSimulate} className="btn btn-secondary" title="Simulate incoming GPS packet">
-              <Play size={16} />
-              <span>Simulate Ping</span>
-            </button>
-
-            <button onClick={() => setShowSettings(true)} className="btn btn-icon" title="Server Connection Settings">
-              <Settings size={18} />
-            </button>
-          </div>
+        <div className="topbar-actions">
+          <span className={`status status-${connection}`}>
+            {connection === 'offline' ? <LuWifiOff /> : <LuWifi />}
+            <i className="status-dot" />
+            {statusText}
+          </span>
+          <button className="btn" onClick={simulate} title="Send a simulated GPS packet">
+            <LuPlay /> <span>Simulate</span>
+          </button>
         </div>
       </header>
 
-      {/* Telemetry Metric Cards */}
-      <section className="telemetry-grid">
-        {/* Card 1: Coordinates */}
-        <div className="card metric-card">
-          <div className="card-header">
-            <div className="card-icon blue">
-              <MapPin size={18} />
+      <div className="layout">
+        <aside className="panel">
+          <section className="card hero-card">
+            <div className="card-head">
+              <span className="icon blue"><LuMapPin /></span>
+              <span className="label">Position</span>
+              <button className="chip-btn" onClick={copyCoords} disabled={!latestPoint}>
+                {copied ? <LuCheck /> : <LuCopy />} {copied ? 'Copied' : 'Copy'}
+              </button>
             </div>
-            <span className="card-label">CURRENT COORDINATES</span>
-            <button onClick={handleCopyCoords} className="copy-chip" title="Copy to clipboard">
-              {copied ? <Check size={12} /> : <Copy size={12} />}
-              <span>{copied ? 'Copied!' : 'Copy'}</span>
-            </button>
-          </div>
-          <div className="coords-display">
-            <div className="coord-row">
-              <span className="coord-tag">LAT</span>
-              <span className="coord-val mono">
-                {latestPoint ? latestPoint.latitude.toFixed(6) : '--.------'}
-              </span>
+            <div className="coords">
+              <div><small>LAT</small><b className="mono">{latestPoint ? latestPoint.latitude.toFixed(6) : '--.------'}</b></div>
+              <div><small>LNG</small><b className="mono">{latestPoint ? latestPoint.longitude.toFixed(6) : '--.------'}</b></div>
             </div>
-            <div className="coord-row">
-              <span className="coord-tag">LNG</span>
-              <span className="coord-val mono">
-                {latestPoint ? latestPoint.longitude.toFixed(6) : '--.------'}
-              </span>
-            </div>
-          </div>
-          <div className="card-footer">
-            <a href={gmapsUrl} target="_blank" rel="noopener noreferrer" className="footer-link">
-              <span>View on Google Maps</span>
-              <ExternalLink size={13} />
+            <a className="link" href={gmaps} target="_blank" rel="noopener noreferrer">
+              Open in Google Maps <LuExternalLink />
             </a>
-          </div>
-        </div>
+          </section>
 
-        {/* Card 2: Speed / Velocity */}
-        <div className="card metric-card">
-          <div className="card-header">
-            <div className="card-icon emerald">
-              <Gauge size={18} />
-            </div>
-            <span className="card-label">CURRENT SPEED</span>
-            <span className={`chip ${speedKmph > 2 ? 'chip-green' : 'chip-gray'}`}>
-              {speedKmph > 2 ? 'Moving' : 'Stationary'}
-            </span>
-          </div>
-          <div className="metric-main">
-            <div className="metric-big-num">
-              <span className="mono">{speedKmph.toFixed(1)}</span>
-              <span className="unit">km/h</span>
-            </div>
-            <div className="metric-sub-num">
-              ≈ <span className="mono">{speedMph}</span> mph
-            </div>
-          </div>
-          <div className="card-footer">
-            <div className="progress-bar-bg">
-              <div className="progress-bar-fill" style={{ width: `${speedBarWidth}%` }}></div>
-            </div>
-          </div>
-        </div>
-
-        {/* Card 3: Satellites */}
-        <div className="card metric-card">
-          <div className="card-header">
-            <div className="card-icon purple">
-              <Compass size={18} />
-            </div>
-            <span className="card-label">SATELLITES IN VIEW</span>
-            <span className={`chip ${fixQualityClass}`}>{fixQualityText}</span>
-          </div>
-          <div className="metric-main">
-            <div className="metric-big-num">
-              <span className="mono">{sats}</span>
-              <span className="unit">sats</span>
-            </div>
-            <div className="satellite-signal-bars">
-              <span className="bar bar-1" style={{ background: sats >= 1 ? '#8b5cf6' : '#cbd5e1' }}></span>
-              <span className="bar bar-2" style={{ background: sats >= 4 ? '#8b5cf6' : '#cbd5e1' }}></span>
-              <span className="bar bar-3" style={{ background: sats >= 7 ? '#8b5cf6' : '#cbd5e1' }}></span>
-              <span className="bar bar-4" style={{ background: sats >= 10 ? '#8b5cf6' : '#cbd5e1' }}></span>
-            </div>
-          </div>
-          <div className="card-footer text-muted">
-            <span>Altitude: <strong className="mono">{latestPoint?.altitude ? latestPoint.altitude.toFixed(1) : '--'}</strong> m</span>
-          </div>
-        </div>
-
-        {/* Card 4: Distance & Route */}
-        <div className="card metric-card">
-          <div className="card-header">
-            <div className="card-icon amber">
-              <Crosshair size={18} />
-            </div>
-            <span className="card-label">TRAVEL DISTANCE</span>
-            <span className="chip chip-blue">{history.length} points</span>
-          </div>
-          <div className="metric-main">
-            <div className="metric-big-num">
-              <span className="mono">{totalDistanceKm.toFixed(2)}</span>
-              <span className="unit">km</span>
-            </div>
-            <div className="metric-sub-num">Total path length</div>
-          </div>
-          <div className="card-footer actions-footer">
-            <button onClick={handleClearHistory} className="link-btn text-danger">
-              Clear History
-            </button>
-          </div>
-        </div>
-
-        {/* Card 5: Last Update */}
-        <div className="card metric-card">
-          <div className="card-header">
-            <div className="card-icon teal">
-              <Clock size={18} />
-            </div>
-            <span className="card-label">LAST PING</span>
-          </div>
-          <div className="metric-main">
-            <div className="metric-big-num text-sm">
-              <span>{lastPingAgo}</span>
-            </div>
-            <div className="metric-sub-num mono">
-              {latestPoint?.timestamp
-                ? new Date(latestPoint.timestamp).toLocaleTimeString()
-                : '--:--:--'}
-            </div>
-          </div>
-          <div className="card-footer text-muted">
-            <span>Interval: ~5 seconds</span>
-          </div>
-        </div>
-      </section>
-
-      {/* Main Map Canvas */}
-      <main className="map-section">
-        <div className="map-card card">
-          {/* Floating Controls Overlay */}
-          <div className="map-overlay-bar">
-            <div className="overlay-left">
-              <button
-                onClick={handleRecenter}
-                className={`map-btn ${autoRecenter ? 'active-state' : ''}`}
-                title="Recenter on tracker"
-              >
-                <Crosshair size={15} />
-                <span>Recenter</span>
-              </button>
-
-              <button
-                onClick={handleToggleTrail}
-                className={`map-btn ${showTrail ? 'active-state' : ''}`}
-                title="Toggle route trail"
-              >
-                <MapPin size={15} />
-                <span>{showTrail ? 'Trail: ON' : 'Trail: OFF'}</span>
-              </button>
-            </div>
-
-            <div className="overlay-right">
-              <div className="map-layers-group">
-                <button
-                  onClick={() => handleLayerChange('positron')}
-                  className={`layer-pill ${currentLayer === 'positron' ? 'active' : ''}`}
-                >
-                  Minimal Light
-                </button>
-                <button
-                  onClick={() => handleLayerChange('osm')}
-                  className={`layer-pill ${currentLayer === 'osm' ? 'active' : ''}`}
-                >
-                  Street
-                </button>
-                <button
-                  onClick={() => handleLayerChange('satellite')}
-                  className={`layer-pill ${currentLayer === 'satellite' ? 'active' : ''}`}
-                >
-                  Satellite
-                </button>
+          <div className="grid-2">
+            <section className="card stat">
+              <div className="card-head">
+                <span className="icon green"><LuGauge /></span>
+                <span className="label">Speed</span>
               </div>
+              <div className="big"><b className="mono">{speed.toFixed(1)}</b><span>km/h</span></div>
+              <div className="bar"><i style={{ width: `${Math.min(100, speed)}%` }} /></div>
+              <small className="muted">{speed > 2 ? 'Moving' : 'Stationary'} · {(speed * 0.621371).toFixed(1)} mph</small>
+            </section>
+
+            <section className="card stat">
+              <div className="card-head">
+                <span className="icon purple"><LuRadar /></span>
+                <span className="label">Satellites</span>
+              </div>
+              <div className="big"><b className="mono">{sats}</b><span>sats</span></div>
+              <div className="sat-bars">
+                {[1, 4, 7, 10].map((n, i) => (
+                  <i key={n} className={sats >= n ? 'on' : ''} style={{ height: 6 + i * 5 }} />
+                ))}
+              </div>
+              <span className={`tag tag-${fix.tone}`}>{fix.label}</span>
+            </section>
+
+            <section className="card stat">
+              <div className="card-head">
+                <span className="icon amber"><LuRoute /></span>
+                <span className="label">Distance</span>
+              </div>
+              <div className="big"><b className="mono">{totalKm < 1 ? (totalKm * 1000).toFixed(0) : totalKm.toFixed(2)}</b><span>{totalKm < 1 ? 'm' : 'km'}</span></div>
+              <small className="muted">{history.length} points logged</small>
+              <button className="link danger" onClick={clearHistory}><LuTrash2 /> Clear trail</button>
+            </section>
+
+            <section className="card stat">
+              <div className="card-head">
+                <span className="icon teal"><LuMountain /></span>
+                <span className="label">Altitude</span>
+              </div>
+              <div className="big"><b className="mono">{latestPoint?.altitude ? latestPoint.altitude.toFixed(0) : '--'}</b><span>m</span></div>
+              <small className="muted">above sea level</small>
+            </section>
+          </div>
+
+          <section className="card ping">
+            <span className="icon teal"><LuClock /></span>
+            <div>
+              <b>{timeAgo(latestPoint?.timestamp)}</b>
+              <small className="muted mono">
+                {latestPoint?.timestamp ? new Date(latestPoint.timestamp).toLocaleTimeString() : '--:--:--'}
+              </small>
+            </div>
+            <LuActivity className={`pulse ${connection === 'online' ? 'on' : ''}`} />
+          </section>
+        </aside>
+
+        <main className="map-wrap">
+          <div ref={mapEl} className="map" />
+
+          <div className="map-toolbar">
+            <div className="seg">
+              {LAYERS.map((l) => (
+                <button key={l.key} className={layer === l.key ? 'active' : ''} onClick={() => setLayer(l.key)}>
+                  {l.label}
+                </button>
+              ))}
+            </div>
+            <div className="tools">
+              <button className={`tool ${autoRecenter ? 'active' : ''}`} onClick={recenter} title="Follow tracker">
+                <LuLocateFixed />
+              </button>
+              <button className={`tool ${showTrail ? 'active' : ''}`} onClick={() => setShowTrail((v) => !v)} title="Toggle trail">
+                <LuSpline />
+              </button>
+              <button className="tool" onClick={() => setFullscreen((v) => !v)} title="Fullscreen map">
+                {fullscreen ? <LuMinimize /> : <LuMaximize />}
+              </button>
             </div>
           </div>
 
-          {/* Leaflet Map Div */}
-          <div ref={mapContainerRef} style={{ width: '100%', height: '100%' }}></div>
-
-          {/* Empty Waiting Overlay */}
           {!latestPoint && (
-            <div className="map-empty-overlay">
-              <div className="empty-state-box">
-                <div className="radar-scan-anim">
-                  <div className="circle c1"></div>
-                  <div className="circle c2"></div>
-                  <div className="circle c3"></div>
-                  <div className="radar-line"></div>
-                </div>
-                <h3>Waiting for GPS Coordinates</h3>
-                <p>
-                  Ensure your ESP8266 is powered on, connected to WiFi, and the Neo-6M GPS antenna has clear line of sight to open sky.
-                </p>
-                <div className="empty-actions">
-                  <button onClick={handleSimulate} className="btn btn-primary">
-                    Try Simulated Location
-                  </button>
-                </div>
-              </div>
+            <div className="empty">
+              <div className="radar"><i /><i /><i /><LuNavigation /></div>
+              <h3>Waiting for GPS coordinates</h3>
+              <p>Power the ESP8266 and keep the Neo-6M antenna under open sky. The first fix can take a few minutes.</p>
+              <button className="btn primary" onClick={simulate}><LuPlay /> Try simulated location</button>
             </div>
           )}
-        </div>
-      </main>
+        </main>
+      </div>
 
-      {/* Recent Packet Logs Drawer */}
-      <section className="logs-section">
-        <div className="card logs-card">
-          <div className="logs-header">
-            <div className="logs-title">
-              <Satellite size={18} />
-              <h3>Live Packet Stream</h3>
-              <span className="badge">{history.length} pings</span>
-            </div>
-            <button
-              onClick={() => setShowLogs(v => !v)}
-              className="btn btn-subtle text-sm"
-              style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-            >
-              <span>{showLogs ? 'Hide Details' : 'Show Details'}</span>
-              {showLogs ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-            </button>
-          </div>
-
-          {showLogs && (
-            <div className="logs-body">
-              <table className="logs-table">
-                <thead>
-                  <tr>
-                    <th>Timestamp</th>
-                    <th>Latitude</th>
-                    <th>Longitude</th>
-                    <th>Speed (km/h)</th>
-                    <th>Satellites</th>
-                    <th>Altitude</th>
-                    <th>Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {history.length === 0 ? (
-                    <tr className="empty-row">
-                      <td colSpan={7}>No packets received yet. Power on ESP8266 or click "Simulate Ping".</td>
+      <section className="logs card">
+        <button className="logs-head" onClick={() => setShowLogs((v) => !v)}>
+          <span><LuSatellite /> Packet log <em>{history.length}</em></span>
+          {showLogs ? <LuChevronDown /> : <LuChevronUp />}
+        </button>
+        {showLogs && (
+          <div className="logs-body">
+            <table>
+              <thead>
+                <tr><th>Time</th><th>Latitude</th><th>Longitude</th><th>km/h</th><th>Sats</th><th>Alt</th><th /></tr>
+              </thead>
+              <tbody>
+                {history.length === 0 ? (
+                  <tr><td colSpan={7} className="muted">No packets yet.</td></tr>
+                ) : (
+                  [...history].reverse().slice(0, 30).map((p, i) => (
+                    <tr key={`${p.timestamp}-${i}`}>
+                      <td className="mono">{p.timestamp ? new Date(p.timestamp).toLocaleTimeString() : '--'}</td>
+                      <td className="mono">{p.latitude.toFixed(6)}</td>
+                      <td className="mono">{p.longitude.toFixed(6)}</td>
+                      <td>{(p.speed || 0).toFixed(1)}</td>
+                      <td>{p.satellites || 0}</td>
+                      <td>{p.altitude ? p.altitude.toFixed(0) : '--'} m</td>
+                      <td><a className="link" href={`https://www.google.com/maps?q=${p.latitude},${p.longitude}`} target="_blank" rel="noopener noreferrer">Map</a></td>
                     </tr>
-                  ) : (
-                    [...history]
-                      .reverse()
-                      .slice(0, 20)
-                      .map((p, idx) => (
-                        <tr key={idx}>
-                          <td className="mono">{new Date(p.timestamp || Date.now()).toLocaleTimeString()}</td>
-                          <td className="mono">{p.latitude.toFixed(6)}</td>
-                          <td className="mono">{p.longitude.toFixed(6)}</td>
-                          <td>{(p.speed || 0).toFixed(1)}</td>
-                          <td>{p.satellites || 0}</td>
-                          <td>{p.altitude ? p.altitude.toFixed(1) : '--'} m</td>
-                          <td>
-                            <a
-                              href={`https://www.google.com/maps?q=${p.latitude},${p.longitude}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="footer-link"
-                            >
-                              Map
-                            </a>
-                          </td>
-                        </tr>
-                      ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      </section>
-
-      {/* Settings Modal */}
-      {showSettings && (
-        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
-          <div className="modal-card" onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3>Backend Server Connection</h3>
-              <button onClick={() => setShowSettings(false)} className="modal-close">
-                <X size={20} />
-              </button>
-            </div>
-            <div className="modal-body">
-              <p className="modal-desc">
-                By default, this dashboard connects to your local or Render backend. If deployed separately, enter your Render service URL below.
-              </p>
-
-              <div className="form-group">
-                <label>Backend URL (Render or Localhost)</label>
-                <input
-                  type="url"
-                  value={tempUrl}
-                  onChange={e => setTempUrl(e.target.value)}
-                  placeholder="https://your-gps-server.onrender.com"
-                />
-                <small className="form-help">Leave empty for same origin.</small>
-              </div>
-
-              <div className="form-group">
-                <label>API Key (x-api-key)</label>
-                <input
-                  type="text"
-                  value={tempKey}
-                  onChange={e => setTempKey(e.target.value)}
-                  placeholder="YOUR_SECRET_API_KEY"
-                />
-                <small className="form-help">Matches the API_KEY environment variable on Render.</small>
-              </div>
-
-              <div className="modal-info-box">
-                <strong>ESP8266 Target Endpoint:</strong>
-                <code>{`${(tempUrl || window.location.origin).replace(/\/$/, '')}/api/location`}</code>
-              </div>
-            </div>
-            <div className="modal-footer">
-              <button onClick={handleResetSettings} className="btn btn-secondary">
-                Reset Default
-              </button>
-              <button onClick={handleSaveSettings} className="btn btn-primary">
-                Save & Connect
-              </button>
-            </div>
+                  ))
+                )}
+              </tbody>
+            </table>
           </div>
-        </div>
-      )}
+        )}
+      </section>
     </div>
   );
 }

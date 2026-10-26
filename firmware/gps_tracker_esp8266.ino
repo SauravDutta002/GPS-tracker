@@ -26,10 +26,8 @@ const char* WIFI_SSID     = "IOT";            // Change if your WiFi name/hotspo
 const char* WIFI_PASSWORD = "123456789";      // Note: If your password literally includes 'IOT ', change to "IOT 123456789"
 
 // ================= RENDER BACKEND CONFIGURATION =================
-// Replace with your deployed Render backend URL or local IP:
-// e.g. "https://your-gps-app.onrender.com/api/location"
-// Or local: "http://192.168.1.100:3000/api/location"
-const char* SERVER_URL    = "https://your-gps-server.onrender.com/api/location";
+// Your deployed Render backend URL:
+const char* SERVER_URL    = "https://gps-tracker-m6wx.onrender.com/api/location";
 
 // Must match the API_KEY set in your backend environment
 const char* API_KEY       = "YOUR_SECRET_API_KEY";
