@@ -14,7 +14,6 @@ import {
   LuTrash2,
   LuChevronUp,
   LuChevronDown,
-  LuPlay,
   LuMaximize,
   LuMinimize,
   LuWifi,
@@ -387,14 +386,6 @@ export default function App() {
     setHistory(latestPoint ? [latestPoint] : []);
   };
 
-  const simulate = async () => {
-    try {
-      await fetch(`${BACKEND_URL}/api/simulate`, { method: 'POST', headers: jsonHeaders });
-    } catch (err) {
-      alert(`Simulation failed: ${err.message}`);
-    }
-  };
-
   const speed = live?.speed || 0;
   const sats = live?.satellites || 0;
   const fix = fixQuality(sats);
@@ -430,9 +421,6 @@ export default function App() {
             {status.text}
             <i className="status-dot" />
           </span>
-          <button className="btn" onClick={simulate} title="Send a simulated GPS packet">
-            <LuPlay /> <span>Simulate</span>
-          </button>
         </div>
       </header>
 
